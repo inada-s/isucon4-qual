@@ -226,9 +226,6 @@ func getIndex(ctx *fasthttp.RequestCtx) {
 <html>
   <head>
     <meta charset="UTF-8">
-    <link rel="stylesheet" href="/stylesheets/bootstrap.min.css">
-    <link rel="stylesheet" href="/stylesheets/bootflat.min.css">
-    <link rel="stylesheet" href="/stylesheets/isucon-bank.css">
     <title>isucon4</title>
   </head>
   <body>
@@ -321,9 +318,6 @@ func getMyPage(ctx *fasthttp.RequestCtx) {
 <html>
   <head>
     <meta charset="UTF-8">
-    <link rel="stylesheet" href="/stylesheets/bootstrap.min.css">
-    <link rel="stylesheet" href="/stylesheets/bootflat.min.css">
-    <link rel="stylesheet" href="/stylesheets/isucon-bank.css">
     <title>isucon4</title>
   </head>
   <body>
