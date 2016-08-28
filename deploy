@@ -1,0 +1,4 @@
+#!/bin/bash
+sudo cp ./nginx.conf /etc/nginx/nginx.conf
+sudo cp ./my.cnf /etc/my.cnf
+

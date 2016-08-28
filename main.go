@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"database/sql"
+	"encoding/csv"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,8 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-martini/martini"
@@ -34,9 +37,148 @@ var (
 	ErrLockedUser    = errors.New("Locked user")
 	ErrUserNotFound  = errors.New("Not found user")
 	ErrWrongPassword = errors.New("Wrong password")
+
+	LoginLogMtx              sync.Mutex
+	LoginLogs                []LoginLog
+	LoginFailedCountByIP     map[string]int
+	LoginFailedCountByUserID map[int]int
+	LastLoginLog             map[int]LoginLog
+	PrevLoginLog             map[int]LoginLog
+
+	UsersMtx sync.Mutex
+	Users map[string]User
+	UsersID map[int]User
 )
 
+func addLoginLog(ll LoginLog) {
+	LoginLogMtx.Lock()
+	ll.ID = len(LoginLogs) + 1
+	if ll.Succeeded == 0 {
+		LoginFailedCountByIP[ll.IP] += 1
+		LoginFailedCountByUserID[ll.UserID] += 1
+	} else {
+		LoginFailedCountByIP[ll.IP] = 0
+		LoginFailedCountByUserID[ll.UserID] = 0
+
+		prev, ok := LastLoginLog[ll.UserID]
+		if ok {
+			PrevLoginLog[ll.UserID] = prev
+		}
+		LastLoginLog[ll.UserID] = ll
+	}
+	LoginLogs = append(LoginLogs, ll)
+	LoginLogMtx.Unlock()
+}
+
+type User struct {
+	ID           int
+	Login        string
+	PasswordHash string
+	Salt         string
+
+	LastLogin *LastLogin
+}
+
+type LastLogin struct {
+	Login     string
+	IP        string
+	CreatedAt time.Time
+}
+
+type LoginLog struct {
+	ID        int
+	CreatedAt time.Time
+	UserID    int
+	Name      string
+	IP        string
+	Succeeded int
+}
+
+func initLoginLog() {
+	dummyLog, err := os.Open("dummy_log.tsv")
+	if err != nil {
+		log.Fatal(err)
+	}
+	r := csv.NewReader(dummyLog)
+	r.Comma = '\t'
+	records, err := r.ReadAll()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for _, line := range records {
+		var ll LoginLog
+		/*
+			i+1         ID
+			line[0]     CreatedAt
+			line[1]     UserID
+			line[2]     Login (UserName)
+			line[3]     IPAddr
+			line[4]     Succeeded
+		*/
+		ll.CreatedAt, err = time.Parse("2006-01-02 15:04:05 -0700", strings.Trim(line[0], "' "))
+		if err != nil {
+			log.Fatal(err)
+		}
+		uid, err := strconv.ParseInt(strings.Trim(line[1], " "), 10, 32)
+		if err != nil {
+			log.Fatal(err)
+		}
+		ll.UserID = int(uid)
+		ll.Name = strings.Trim(line[2], "' ")
+		ll.IP = strings.Trim(line[3], "' ")
+		if strings.Contains(line[4], "1") {
+			ll.Succeeded = 1
+		}
+		addLoginLog(ll)
+	}
+}
+
+func initUsers() {
+	dummyUsers, err := os.Open("dummy_users.tsv")
+	if err != nil {
+		log.Fatal(err)
+	}
+	r := csv.NewReader(dummyUsers)
+	r.Comma = '\t'
+	records, err := r.ReadAll()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	UsersMtx.Lock()
+	defer UsersMtx.Unlock()
+	for _, line := range records {
+		var u User
+		/*
+			line[0]     ID
+			line[1]     Login
+			line[2]     Pass
+			line[3]     Salt
+			line[4]     Hash
+		*/
+		uid, err := strconv.ParseInt(strings.Trim(line[0], " "), 10, 32)
+		if err != nil {
+			log.Fatal(err)
+		}
+		u.ID = int(uid)
+		u.Login = strings.Trim(line[1], "' ")
+		u.Salt = strings.Trim(line[3], "' ")
+		u.PasswordHash = strings.Trim(line[4], "' ")
+		Users[u.Login] = u
+		UsersID[u.ID] = u
+	}
+	log.Println(Users["isucon2"])
+}
+
 func init() {
+	LoginFailedCountByIP = map[string]int{}
+	LoginFailedCountByUserID = map[int]int{}
+	LastLoginLog = map[int]LoginLog{}
+	PrevLoginLog = map[int]LoginLog{}
+	Users = map[string]User{}
+	UsersID = map[int]User{}
+
 	dsn := fmt.Sprintf(
 		"%s:%s@tcp(%s:%s)/%s?parseTime=true&loc=Local",
 		getEnv("ISU4_DB_USER", "root"),
@@ -62,9 +204,12 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
+	initLoginLog()
+	initUsers()
 }
 
 func main() {
+	runtime.GOMAXPROCS(4)
 	runtime.MemProfileRate = 1024
 	http.HandleFunc("/startprof", func(w http.ResponseWriter, r *http.Request) {
 		f, err := os.Create(cpuProfileFile)
@@ -194,42 +339,50 @@ func calcPassHash(password, hash string) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-type User struct {
-	ID           int
-	Login        string
-	PasswordHash string
-	Salt         string
-
-	LastLogin *LastLogin
-}
-
-type LastLogin struct {
-	Login     string
-	IP        string
-	CreatedAt time.Time
-}
-
 func (u *User) getLastLogin() *LastLogin {
-	rows, err := db.Query(
-		"SELECT login, ip, created_at FROM login_log WHERE succeeded = 1 AND user_id = ? ORDER BY id DESC LIMIT 2",
-		u.ID,
-	)
-
-	if err != nil {
-		return nil
+	prev, ok := PrevLoginLog[u.ID]
+	if ok {
+		u.LastLogin = &LastLogin{}
+		u.LastLogin.Login = prev.Name
+		u.LastLogin.IP = prev.IP
+		u.LastLogin.CreatedAt = prev.CreatedAt
+		return u.LastLogin
 	}
 
-	defer rows.Close()
-	for rows.Next() {
+	last, ok := LastLoginLog[u.ID]
+	if ok {
 		u.LastLogin = &LastLogin{}
-		err = rows.Scan(&u.LastLogin.Login, &u.LastLogin.IP, &u.LastLogin.CreatedAt)
+		u.LastLogin.Login = last.Name
+		u.LastLogin.IP = last.IP
+		u.LastLogin.CreatedAt = last.CreatedAt
+		return u.LastLogin
+	}
+	return nil
+
+	/*
+		// ログインログからこのユーザの前回の(１回前の)成功ログインを返す.
+		// ただし初回ログインのときはそのログインを返す.
+		rows, err := db.Query(
+			"SELECT login, ip, created_at FROM login_log WHERE succeeded = 1 AND user_id = ? ORDER BY id DESC LIMIT 2",
+			u.ID,
+		)
+
 		if err != nil {
-			u.LastLogin = nil
 			return nil
 		}
-	}
 
-	return u.LastLogin
+		defer rows.Close()
+		for rows.Next() {
+			u.LastLogin = &LastLogin{}
+			err = rows.Scan(&u.LastLogin.Login, &u.LastLogin.IP, &u.LastLogin.CreatedAt)
+			if err != nil {
+				u.LastLogin = nil
+				return nil
+			}
+		}
+
+		return u.LastLogin
+	*/
 }
 
 func createLoginLog(succeeded bool, remoteAddr, login string, user *User) error {
@@ -243,6 +396,14 @@ func createLoginLog(succeeded bool, remoteAddr, login string, user *User) error 
 		userId.Int64 = int64(user.ID)
 		userId.Valid = true
 	}
+
+	var ll LoginLog
+	ll.CreatedAt = time.Now()
+	ll.UserID = user.ID
+	ll.Name = user.Login
+	ll.IP = remoteAddr
+	ll.Succeeded = succ
+	addLoginLog(ll)
 
 	_, err := db.Exec(
 		"INSERT INTO login_log (`created_at`, `user_id`, `login`, `ip`, `succeeded`) "+
@@ -258,43 +419,66 @@ func isLockedUser(user *User) (bool, error) {
 		return false, nil
 	}
 
-	var ni sql.NullInt64
-	row := db.QueryRow(
-		"SELECT COUNT(1) AS failures FROM login_log WHERE "+
-			"user_id = ? AND id > IFNULL((select id from login_log where user_id = ? AND "+
-			"succeeded = 1 ORDER BY id DESC LIMIT 1), 0);",
-		user.ID, user.ID,
-	)
-	err := row.Scan(&ni)
-
-	switch {
-	case err == sql.ErrNoRows:
-		return false, nil
-	case err != nil:
-		return false, err
+	LoginLogMtx.Lock()
+	cnt, ok := LoginFailedCountByUserID[user.ID]
+	LoginLogMtx.Unlock()
+	if !ok {
+		cnt = 0
 	}
+	return UserLockThreshold <= cnt, nil
 
-	return UserLockThreshold <= int(ni.Int64), nil
+	/*
+		var ni sql.NullInt64
+		// ログインログからこのユーザのログイン失敗回数を返す.
+		// ただしログインに成功するとログイン失敗回数は0となる.
+		row := db.QueryRow(
+			"SELECT COUNT(1) AS failures FROM login_log WHERE "+
+				"user_id = ? AND id > IFNULL((select id from login_log where user_id = ? AND "+
+				"succeeded = 1 ORDER BY id DESC LIMIT 1), 0);",
+			user.ID, user.ID,
+		)
+		err := row.Scan(&ni)
+
+		switch {
+		case err == sql.ErrNoRows:
+			return false, nil
+		case err != nil:
+			return false, err
+		}
+
+		return UserLockThreshold <= int(ni.Int64), nil
+	*/
 }
 
 func isBannedIP(ip string) (bool, error) {
-	var ni sql.NullInt64
-	row := db.QueryRow(
-		"SELECT COUNT(1) AS failures FROM login_log WHERE "+
-			"ip = ? AND id > IFNULL((select id from login_log where ip = ? AND "+
-			"succeeded = 1 ORDER BY id DESC LIMIT 1), 0);",
-		ip, ip,
-	)
-	err := row.Scan(&ni)
 
-	switch {
-	case err == sql.ErrNoRows:
-		return false, nil
-	case err != nil:
-		return false, err
+	LoginLogMtx.Lock()
+	cnt, ok := LoginFailedCountByIP[ip]
+	LoginLogMtx.Unlock()
+	if !ok {
+		cnt = 0
 	}
+	return IPBanThreshold <= cnt, nil
 
-	return IPBanThreshold <= int(ni.Int64), nil
+	/*
+		var ni sql.NullInt64
+		// ログインログからこのIPのログイン失敗回数を返す.
+		// ただしログインに成功するとログイン失敗回数は0となる.
+		row := db.QueryRow(
+			"SELECT COUNT(1) AS failures FROM login_log WHERE "+"ip = ? AND id > IFNULL( (select id from login_log where ip = ? AND succeeded = 1 ORDER BY id DESC LIMIT 1), 0);",
+			ip, ip,
+		)
+		err := row.Scan(&ni)
+
+		switch {
+		case err == sql.ErrNoRows:
+			return false, nil
+		case err != nil:
+			return false, err
+		}
+
+		return IPBanThreshold <= int(ni.Int64), nil
+	*/
 }
 
 func attemptLogin(req *http.Request) (*User, error) {
@@ -313,6 +497,7 @@ func attemptLogin(req *http.Request) (*User, error) {
 		createLoginLog(succeeded, remoteAddr, loginName, user)
 	}()
 
+	/*
 	row := db.QueryRow(
 		"SELECT id, login, password_hash, salt FROM users WHERE login = ?",
 		loginName,
@@ -324,6 +509,17 @@ func attemptLogin(req *http.Request) (*User, error) {
 		user = nil
 	case err != nil:
 		return nil, err
+	}
+	*/
+
+	UsersMtx.Lock()
+	u, ok := Users[loginName]
+	UsersMtx.Unlock()
+
+	if !ok {
+		user = nil
+	} else {
+		*user = u
 	}
 
 	if banned, _ := isBannedIP(remoteAddr); banned {
@@ -347,6 +543,7 @@ func attemptLogin(req *http.Request) (*User, error) {
 }
 
 func getCurrentUser(userId interface{}) *User {
+	/*
 	user := &User{}
 	row := db.QueryRow(
 		"SELECT id, login, password_hash, salt FROM users WHERE id = ?",
@@ -357,8 +554,21 @@ func getCurrentUser(userId interface{}) *User {
 	if err != nil {
 		return nil
 	}
+	*/
 
-	return user
+	uid, err := strconv.Atoi(fmt.Sprint(userId))
+	if err != nil {
+		log.Println(err)
+		return nil
+	}
+	UsersMtx.Lock()
+	user, ok := UsersID[uid]
+	UsersMtx.Unlock()
+
+	if !ok {
+		return nil
+	}
+	return &user
 }
 
 func bannedIPs() []string {
