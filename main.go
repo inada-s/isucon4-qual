@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,16 +18,19 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-martini/martini"
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/martini-contrib/render"
-	"github.com/martini-contrib/sessions"
+
+	"github.com/fasthttp-contrib/sessions"
+	_ "github.com/fasthttp-contrib/sessions/providers/memory"
+	"github.com/valyala/fasthttp"
 )
 
 var (
 	cpuProfileFile   = "/tmp/cpu.pprof"
 	memProfileFile   = "/tmp/mem.pprof"
 	blockProfileFile = "/tmp/block.pprof"
+
+	sess *sessions.Manager
 
 	db *sql.DB
 
@@ -46,8 +50,8 @@ var (
 	PrevLoginLog             map[int]LoginLog
 
 	UsersMtx sync.Mutex
-	Users map[string]User
-	UsersID map[int]User
+	Users    map[string]User
+	UsersID  map[int]User
 )
 
 func addLoginLog(ll LoginLog) {
@@ -109,7 +113,6 @@ func initLoginLog() {
 	for _, line := range records {
 		var ll LoginLog
 		/*
-			i+1         ID
 			line[0]     CreatedAt
 			line[1]     UserID
 			line[2]     Login (UserName)
@@ -172,6 +175,7 @@ func initUsers() {
 }
 
 func init() {
+	sess = sessions.New("memory", "isucon_go_session", time.Duration(60)*time.Minute)
 	LoginFailedCountByIP = map[string]int{}
 	LoginFailedCountByUserID = map[int]int{}
 	LastLoginLog = map[int]LoginLog{}
@@ -206,6 +210,190 @@ func init() {
 	}
 	initLoginLog()
 	initUsers()
+}
+
+func getIndex(ctx *fasthttp.RequestCtx) {
+	s := sess.Start(ctx)
+	flash := ""
+
+	value := s.Get("notice")
+	if value != nil {
+		s.Delete("notice")
+		flash = value.(string)
+	}
+	ctx.SetContentType("text/html")
+	ctx.WriteString(`<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="/stylesheets/bootstrap.min.css">
+    <link rel="stylesheet" href="/stylesheets/bootflat.min.css">
+    <link rel="stylesheet" href="/stylesheets/isucon-bank.css">
+    <title>isucon4</title>
+  </head>
+  <body>
+    <div class="container">
+      <h1 id="topbar">
+        <a href="/"><img src="/images/isucon-bank.png" alt="いすこん銀行 オンラインバンキングサービス"></a>
+      </h1>
+      <div id="be-careful-phising" class="panel panel-danger">
+  <div class="panel-heading">
+    <span class="hikaru-mozi">偽画面にご注意ください！</span>
+  </div>
+  <div class="panel-body">
+    <p>偽のログイン画面を表示しお客様の情報を盗み取ろうとする犯罪が多発しています。</p>
+    <p>ログイン直後にダウンロード中や、見知らぬウィンドウが開いた場合、<br>すでにウィルスに感染している場合がございます。即座に取引を中止してください。</p>
+    <p>また、残高照会のみなど、必要のない場面で乱数表の入力を求められても、<br>絶対に入力しないでください。</p>
+  </div>
+</div>
+
+<div class="page-header">
+  <h1>ログイン</h1>
+</div>`)
+	if flash != "" {
+		ctx.WriteString(`<div id="notice-message" class="alert alert-danger" role="alert">`)
+		ctx.WriteString(flash)
+		ctx.WriteString(`</div>`)
+	}
+
+	ctx.WriteString(`
+<div class="container">
+  <form class="form-horizontal" role="form" action="/login" method="POST">
+    <div class="form-group">
+      <label for="input-username" class="col-sm-3 control-label">お客様ご契約ID</label>
+      <div class="col-sm-9">
+        <input id="input-username" type="text" class="form-control" placeholder="半角英数字" name="login">
+      </div>
+    </div>
+    <div class="form-group">
+      <label for="input-password" class="col-sm-3 control-label">パスワード</label>
+      <div class="col-sm-9">
+        <input type="password" class="form-control" id="input-password" name="password" placeholder="半角英数字・記号（２文字以上）">
+      </div>
+    </div>
+    <div class="form-group">
+      <div class="col-sm-offset-3 col-sm-9">
+        <button type="submit" class="btn btn-primary btn-lg btn-block">ログイン</button>
+      </div>
+    </div>
+  </form>
+</div>
+</div>`)
+}
+
+func postLogin(ctx *fasthttp.RequestCtx) {
+	s := sess.Start(ctx)
+	user, err := attemptLogin(ctx)
+
+	notice := ""
+	if err != nil || user == nil {
+		switch err {
+		case ErrBannedIP:
+			notice = "You're banned."
+		case ErrLockedUser:
+			notice = "This account is locked."
+		default:
+			notice = "Wrong username or password"
+		}
+
+		s.Set("notice", notice)
+		ctx.Redirect("/", http.StatusFound)
+		return
+	}
+
+	s.Set("user_id", strconv.Itoa(user.ID))
+	ctx.Redirect("/mypage", http.StatusFound)
+}
+
+func getMyPage(ctx *fasthttp.RequestCtx) {
+	s := sess.Start(ctx)
+	currentUser := getCurrentUser(s.Get("user_id"))
+
+	if currentUser == nil {
+		s.Set("notice", "You must be logged in")
+		ctx.Redirect("/", http.StatusFound)
+		return
+	}
+
+	ll := currentUser.getLastLogin()
+	ctx.SetContentType("text/html")
+	ctx.WriteString(`<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="/stylesheets/bootstrap.min.css">
+    <link rel="stylesheet" href="/stylesheets/bootflat.min.css">
+    <link rel="stylesheet" href="/stylesheets/isucon-bank.css">
+    <title>isucon4</title>
+  </head>
+  <body>
+    <div class="container">
+      <h1 id="topbar">
+        <a href="/"><img src="/images/isucon-bank.png" alt="いすこん銀行 オンラインバンキングサービス"></a>
+      </h1>
+<div class="alert alert-success" role="alert">
+  ログインに成功しました。<br>
+  未読のお知らせが０件、残っています。
+</div>
+
+<dl class="dl-horizontal">
+  <dt>前回ログイン</dt>
+  <dd id="last-logined-at">`)
+	ctx.WriteString(ll.CreatedAt.Format("2006-01-02 15:04:05"))
+	ctx.WriteString(`</dd>
+  <dt>最終ログインIPアドレス</dt>
+  <dd id="last-logined-ip">`)
+	ctx.WriteString(ll.IP)
+	ctx.WriteString(`</dd>
+</dl>
+
+<div class="panel panel-default">
+  <div class="panel-heading">
+    お客様ご契約ID：`)
+	ctx.WriteString(ll.Login)
+	ctx.WriteString(` 様の代表口座
+  </div>
+  <div class="panel-body">
+    <div class="row">
+      <div class="col-sm-4">
+        普通預金<br>
+        <small>東京支店　1111111111</small><br>
+      </div>
+      <div class="col-sm-4">
+        <p id="zandaka" class="text-right">
+          ―――円
+        </p>
+      </div>
+
+      <div class="col-sm-4">
+        <p>
+          <a class="btn btn-success btn-block">入出金明細を表示</a>
+          <a class="btn btn-default btn-block">振込・振替はこちらから</a>
+        </p>
+      </div>
+
+      <div class="col-sm-12">
+        <a class="btn btn-link btn-block">定期預金・住宅ローンのお申込みはこちら</a>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+  </body>
+</html>
+`)
+}
+
+func getReport(ctx *fasthttp.RequestCtx) {
+	resp, err := json.Marshal(struct {
+		BannedIPS   []string `json:"banned_ips"`
+		LockedUsers []string `json:"locked_users"`
+	}{bannedIPs(), lockedUsers()})
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx.SetContentType("application/json")
+	ctx.Write(resp)
 }
 
 func main() {
@@ -250,64 +438,24 @@ func main() {
 		log.Println(http.ListenAndServe("localhost:6060", nil))
 	}()
 
-	m := martini.Classic()
-
-	store := sessions.NewCookieStore([]byte("secret-isucon"))
-	m.Use(sessions.Sessions("isucon_go_session", store))
-
-	m.Use(martini.Static("./public"))
-	m.Use(render.Renderer(render.Options{
-		Layout: "layout",
-	}))
-
-	m.Get("/", func(r render.Render, session sessions.Session) {
-		r.HTML(200, "index", map[string]string{"Flash": getFlash(session, "notice")})
-	})
-
-	m.Post("/login", func(req *http.Request, r render.Render, session sessions.Session) {
-		user, err := attemptLogin(req)
-
-		notice := ""
-		if err != nil || user == nil {
-			switch err {
-			case ErrBannedIP:
-				notice = "You're banned."
-			case ErrLockedUser:
-				notice = "This account is locked."
-			default:
-				notice = "Wrong username or password"
-			}
-
-			session.Set("notice", notice)
-			r.Redirect("/")
-			return
+	h := func(ctx *fasthttp.RequestCtx) {
+		switch string(ctx.Path()) {
+		case "/":
+			getIndex(ctx)
+		case "/login":
+			postLogin(ctx)
+		case "/mypage":
+			getMyPage(ctx)
+		case "/report":
+			getReport(ctx)
+		default:
+			ctx.Error("not found", fasthttp.StatusNotFound)
 		}
+	}
 
-		session.Set("user_id", strconv.Itoa(user.ID))
-		r.Redirect("/mypage")
-	})
-
-	m.Get("/mypage", func(r render.Render, session sessions.Session) {
-		currentUser := getCurrentUser(session.Get("user_id"))
-
-		if currentUser == nil {
-			session.Set("notice", "You must be logged in")
-			r.Redirect("/")
-			return
-		}
-
-		currentUser.getLastLogin()
-		r.HTML(200, "mypage", currentUser)
-	})
-
-	m.Get("/report", func(r render.Render) {
-		r.JSON(200, map[string][]string{
-			"banned_ips":   bannedIPs(),
-			"locked_users": lockedUsers(),
-		})
-	})
-
-	http.ListenAndServe(":8080", m)
+	if err := fasthttp.ListenAndServe(":8080", h); err != nil {
+		log.Fatalf("Error in ListenAndServe: %s", err)
+	}
 }
 
 func getEnv(key string, def string) string {
@@ -317,17 +465,6 @@ func getEnv(key string, def string) string {
 	}
 
 	return v
-}
-
-func getFlash(session sessions.Session, key string) string {
-	value := session.Get(key)
-
-	if value == nil {
-		return ""
-	} else {
-		session.Delete(key)
-		return value.(string)
-	}
 }
 
 func calcPassHash(password, hash string) string {
@@ -358,31 +495,6 @@ func (u *User) getLastLogin() *LastLogin {
 		return u.LastLogin
 	}
 	return nil
-
-	/*
-		// ログインログからこのユーザの前回の(１回前の)成功ログインを返す.
-		// ただし初回ログインのときはそのログインを返す.
-		rows, err := db.Query(
-			"SELECT login, ip, created_at FROM login_log WHERE succeeded = 1 AND user_id = ? ORDER BY id DESC LIMIT 2",
-			u.ID,
-		)
-
-		if err != nil {
-			return nil
-		}
-
-		defer rows.Close()
-		for rows.Next() {
-			u.LastLogin = &LastLogin{}
-			err = rows.Scan(&u.LastLogin.Login, &u.LastLogin.IP, &u.LastLogin.CreatedAt)
-			if err != nil {
-				u.LastLogin = nil
-				return nil
-			}
-		}
-
-		return u.LastLogin
-	*/
 }
 
 func createLoginLog(succeeded bool, remoteAddr, login string, user *User) error {
@@ -426,32 +538,9 @@ func isLockedUser(user *User) (bool, error) {
 		cnt = 0
 	}
 	return UserLockThreshold <= cnt, nil
-
-	/*
-		var ni sql.NullInt64
-		// ログインログからこのユーザのログイン失敗回数を返す.
-		// ただしログインに成功するとログイン失敗回数は0となる.
-		row := db.QueryRow(
-			"SELECT COUNT(1) AS failures FROM login_log WHERE "+
-				"user_id = ? AND id > IFNULL((select id from login_log where user_id = ? AND "+
-				"succeeded = 1 ORDER BY id DESC LIMIT 1), 0);",
-			user.ID, user.ID,
-		)
-		err := row.Scan(&ni)
-
-		switch {
-		case err == sql.ErrNoRows:
-			return false, nil
-		case err != nil:
-			return false, err
-		}
-
-		return UserLockThreshold <= int(ni.Int64), nil
-	*/
 }
 
 func isBannedIP(ip string) (bool, error) {
-
 	LoginLogMtx.Lock()
 	cnt, ok := LoginFailedCountByIP[ip]
 	LoginLogMtx.Unlock()
@@ -459,58 +548,24 @@ func isBannedIP(ip string) (bool, error) {
 		cnt = 0
 	}
 	return IPBanThreshold <= cnt, nil
-
-	/*
-		var ni sql.NullInt64
-		// ログインログからこのIPのログイン失敗回数を返す.
-		// ただしログインに成功するとログイン失敗回数は0となる.
-		row := db.QueryRow(
-			"SELECT COUNT(1) AS failures FROM login_log WHERE "+"ip = ? AND id > IFNULL( (select id from login_log where ip = ? AND succeeded = 1 ORDER BY id DESC LIMIT 1), 0);",
-			ip, ip,
-		)
-		err := row.Scan(&ni)
-
-		switch {
-		case err == sql.ErrNoRows:
-			return false, nil
-		case err != nil:
-			return false, err
-		}
-
-		return IPBanThreshold <= int(ni.Int64), nil
-	*/
 }
 
-func attemptLogin(req *http.Request) (*User, error) {
+func attemptLogin(ctx *fasthttp.RequestCtx) (*User, error) {
 	succeeded := false
 	user := &User{}
 
-	loginName := req.PostFormValue("login")
-	password := req.PostFormValue("password")
+	args := ctx.PostArgs()
+	loginName := string(args.Peek("login"))
+	password := string(args.Peek("password"))
 
-	remoteAddr := req.RemoteAddr
-	if xForwardedFor := req.Header.Get("X-Forwarded-For"); len(xForwardedFor) > 0 {
-		remoteAddr = xForwardedFor
+	remoteAddr := ctx.RemoteAddr().String()
+	if xForwardedFor := ctx.Request.Header.Peek("X-Forwarded-For"); len(xForwardedFor) > 0 {
+		remoteAddr = string(xForwardedFor)
 	}
 
 	defer func() {
 		createLoginLog(succeeded, remoteAddr, loginName, user)
 	}()
-
-	/*
-	row := db.QueryRow(
-		"SELECT id, login, password_hash, salt FROM users WHERE login = ?",
-		loginName,
-	)
-	err := row.Scan(&user.ID, &user.Login, &user.PasswordHash, &user.Salt)
-
-	switch {
-	case err == sql.ErrNoRows:
-		user = nil
-	case err != nil:
-		return nil, err
-	}
-	*/
 
 	UsersMtx.Lock()
 	u, ok := Users[loginName]
@@ -543,19 +598,6 @@ func attemptLogin(req *http.Request) (*User, error) {
 }
 
 func getCurrentUser(userId interface{}) *User {
-	/*
-	user := &User{}
-	row := db.QueryRow(
-		"SELECT id, login, password_hash, salt FROM users WHERE id = ?",
-		userId,
-	)
-	err := row.Scan(&user.ID, &user.Login, &user.PasswordHash, &user.Salt)
-
-	if err != nil {
-		return nil
-	}
-	*/
-
 	uid, err := strconv.Atoi(fmt.Sprint(userId))
 	if err != nil {
 		log.Println(err)
@@ -569,138 +611,4 @@ func getCurrentUser(userId interface{}) *User {
 		return nil
 	}
 	return &user
-}
-
-func bannedIPs() []string {
-	ips := []string{}
-
-	rows, err := db.Query(
-		"SELECT ip FROM "+
-			"(SELECT ip, MAX(succeeded) as max_succeeded, COUNT(1) as cnt FROM login_log GROUP BY ip) "+
-			"AS t0 WHERE t0.max_succeeded = 0 AND t0.cnt >= ?",
-		IPBanThreshold,
-	)
-
-	if err != nil {
-		return ips
-	}
-
-	defer rows.Close()
-	for rows.Next() {
-		var ip string
-
-		if err := rows.Scan(&ip); err != nil {
-			return ips
-		}
-		ips = append(ips, ip)
-	}
-	if err := rows.Err(); err != nil {
-		return ips
-	}
-
-	rowsB, err := db.Query(
-		"SELECT ip, MAX(id) AS last_login_id FROM login_log WHERE succeeded = 1 GROUP by ip",
-	)
-
-	if err != nil {
-		return ips
-	}
-
-	defer rowsB.Close()
-	for rowsB.Next() {
-		var ip string
-		var lastLoginId int
-
-		if err := rows.Scan(&ip, &lastLoginId); err != nil {
-			return ips
-		}
-
-		var count int
-
-		err = db.QueryRow(
-			"SELECT COUNT(1) AS cnt FROM login_log WHERE ip = ? AND ? < id",
-			ip, lastLoginId,
-		).Scan(&count)
-
-		if err != nil {
-			return ips
-		}
-
-		if IPBanThreshold <= count {
-			ips = append(ips, ip)
-		}
-	}
-	if err := rowsB.Err(); err != nil {
-		return ips
-	}
-
-	return ips
-}
-
-func lockedUsers() []string {
-	userIds := []string{}
-
-	rows, err := db.Query(
-		"SELECT user_id, login FROM "+
-			"(SELECT user_id, login, MAX(succeeded) as max_succeeded, COUNT(1) as cnt FROM login_log GROUP BY user_id) "+
-			"AS t0 WHERE t0.user_id IS NOT NULL AND t0.max_succeeded = 0 AND t0.cnt >= ?",
-		UserLockThreshold,
-	)
-
-	if err != nil {
-		return userIds
-	}
-
-	defer rows.Close()
-	for rows.Next() {
-		var userId int
-		var login string
-
-		if err := rows.Scan(&userId, &login); err != nil {
-			return userIds
-		}
-		userIds = append(userIds, login)
-	}
-	if err := rows.Err(); err != nil {
-		return userIds
-	}
-
-	rowsB, err := db.Query(
-		"SELECT user_id, login, MAX(id) AS last_login_id FROM login_log WHERE user_id IS NOT NULL AND succeeded = 1 GROUP BY user_id",
-	)
-
-	if err != nil {
-		return userIds
-	}
-
-	defer rowsB.Close()
-	for rowsB.Next() {
-		var userId int
-		var login string
-		var lastLoginId int
-
-		if err := rowsB.Scan(&userId, &login, &lastLoginId); err != nil {
-			return userIds
-		}
-
-		var count int
-
-		err = db.QueryRow(
-			"SELECT COUNT(1) AS cnt FROM login_log WHERE user_id = ? AND ? < id",
-			userId, lastLoginId,
-		).Scan(&count)
-
-		if err != nil {
-			return userIds
-		}
-
-		if UserLockThreshold <= count {
-			userIds = append(userIds, login)
-		}
-	}
-	if err := rowsB.Err(); err != nil {
-		return userIds
-	}
-
-	return userIds
 }
