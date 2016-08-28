@@ -77,10 +77,9 @@ func addLoginLog(ll LoginLog) {
 type User struct {
 	ID           int
 	Login        string
+	Password     string
 	PasswordHash string
 	Salt         string
-
-	LastLogin *LastLogin
 }
 
 type LastLogin struct {
@@ -166,6 +165,7 @@ func initUsers() {
 		}
 		u.ID = int(uid)
 		u.Login = strings.Trim(line[1], "' ")
+		u.Password = strings.Trim(line[2], "' ")
 		u.Salt = strings.Trim(line[3], "' ")
 		u.PasswordHash = strings.Trim(line[4], "' ")
 		Users[u.Login] = u
@@ -471,22 +471,24 @@ func calcPassHash(password, hash string) string {
 }
 
 func (u *User) getLastLogin() *LastLogin {
+	LoginLogMtx.Lock()
+	defer LoginLogMtx.Unlock()
 	prev, ok := PrevLoginLog[u.ID]
 	if ok {
-		u.LastLogin = &LastLogin{}
-		u.LastLogin.Login = prev.Name
-		u.LastLogin.IP = prev.IP
-		u.LastLogin.CreatedAt = prev.CreatedAt
-		return u.LastLogin
+		ll := LastLogin{}
+		ll.Login = prev.Name
+		ll.IP = prev.IP
+		ll.CreatedAt = prev.CreatedAt
+		return &ll
 	}
 
 	last, ok := LastLoginLog[u.ID]
 	if ok {
-		u.LastLogin = &LastLogin{}
-		u.LastLogin.Login = last.Name
-		u.LastLogin.IP = last.IP
-		u.LastLogin.CreatedAt = last.CreatedAt
-		return u.LastLogin
+		ll := LastLogin{}
+		ll.Login = last.Name
+		ll.IP = last.IP
+		ll.CreatedAt = last.CreatedAt
+		return &ll
 	}
 	return nil
 }
@@ -524,7 +526,6 @@ func isLockedUser(user *User) (bool, error) {
 	if user == nil {
 		return false, nil
 	}
-
 	LoginLogMtx.Lock()
 	cnt, ok := LoginFailedCountByUserID[user.ID]
 	LoginLogMtx.Unlock()
@@ -583,7 +584,7 @@ func attemptLogin(ctx *fasthttp.RequestCtx) (*User, error) {
 		return nil, ErrUserNotFound
 	}
 
-	if user.PasswordHash != calcPassHash(password, user.Salt) {
+	if user.Password != password {
 		return nil, ErrWrongPassword
 	}
 
